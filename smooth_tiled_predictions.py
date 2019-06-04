@@ -54,31 +54,74 @@ def _spline_window(window_size, power=2):
     return wind
 
 
-cached_2d_windows = dict()
-def _window_2D(window_size, power=2):
+def _gaus_window(window_size, k = 2.608):
+
+    x = np.arange(window_size)
+    
+    def gaus(x, x0, k):
+        std = np.sqrt( x0**2 / (8*k))
+        a = 2 / (1 - np.exp(-k))
+        c = 2 - a
+        y = a*np.exp(-((x-(x0/2))**2)/(2*std**2)) + c
+        
+        return y
+    
+    window = gaus(x, len(x), k)
+    
+    return window
+    
+
+cached_3d_windows = dict()
+def _window_3D(window_size, mode = "gaus", power=2, k = 2.608):
     """
-    Make a 1D window function, then infer and return a 2D window function.
-    Done with an augmentation, and self multiplication with its transpose.
-    Could be generalized to more dimensions.
+    _WINDOW_3D
+    creates 3D window, either with a 3D gaussian or a 3d square spline
+
+    Args:
+        window_size (int): size of window.
+        mode (string, optional): Mode of 3D window, can be "gaussian" or "spline". Defaults to "gaus".
+        power (int, optional): Power for spline. Defaults to 2.
+        k (float, optional): Parameter for gaussian spline. Defaults to 2.608.
+
+    Raises:
+        ValueError: if mode is unknown.
+
+    Returns:
+        wind (ndarray): 3d window.
+
     """
-    # Memoization
-    global cached_2d_windows
-    key = "{}_{}".format(window_size, power)
-    if key in cached_2d_windows:
-        wind = cached_2d_windows[key]
+    global cached_3d_windows
+    # key = "{}_{}".format(window_size, power)
+    key = "{}_{}_{}".format(mode, window_size, k)
+    if key in cached_3d_windows:
+        wind = cached_3d_windows[key]
     else:
-        wind = _spline_window(window_size, power)
-        wind = np.expand_dims(np.expand_dims(wind, 3), 3)
-        wind = wind * wind.transpose(1, 0, 2)
+        
+        if mode == "gaus":
+             wind = _gaus_window(window_size, k)
+        elif mode == "spline":
+            wind = _spline_window(window_size, power)
+        else:
+            raise ValueError
+
+        wind = np.expand_dims(wind, axis = -1)
+        wind = np.expand_dims(wind, axis = -1)
+        wind = np.expand_dims(wind, axis = -1)
+        
+        wind = wind * wind.transpose(1, 0, 2, 3) * wind.transpose(2,1,0, 3)
+        
+        # profile3d = wind3d[32, 32, :, 0]
+        # plt.plot(profile3d)
+        # plt.show()
+
         if PLOT_PROGRESS:
             # For demo purpose, let's look once at the window:
-            plt.imshow(wind[:, :, 0], cmap="viridis")
-            plt.title("2D Windowing Function for a Smooth Blending of "
+            plt.imshow(wind[32, :, :, 0], cmap="viridis")
+            plt.title("2D Section of 3D windowing function for a Smooth Blending of "
                       "Overlapping Patches")
             plt.show()
-        cached_2d_windows[key] = wind
+        cached_3d_windows[key] = wind
     return wind
-
 
 def _pad_img(img, window_size, subdivisions):
     """
@@ -132,7 +175,7 @@ def _rotate_mirror_do(im):
         for i, ax in enumerate(tqdm(axes)):
             for n_rot in range(4):
                 id_tuple = [flip, i, n_rot]
-                fpath = tmp_path.joinpath("rot_{}_{}_{}.tmp".format(flip,i, n_rot))
+                fpath = tmp_path.joinpath("rot_{}_{}_{}.npy".format(flip,i, n_rot))
                 np.save(file = fpath,
                         arr = np.rot90(np.array(im), k = n_rot, axes = ax))
                 logging.debug("saving {}".format(fpath.name))
@@ -172,8 +215,44 @@ def _rotate_mirror_undo(im_mirrs):
     origs.append(np.rot90(np.array(im_mirrs[7]), axes=(0, 1), k=1)[:, ::-1])
     return np.mean(origs, axis=0)
 
+class prediction_img():
+    def __init__(self, padded_img, pred_func, window, subdivisions):
+        self.padded_img = padded_img
+        self.pred_img = np.zeros_like(padded_img)
+        self.pred_func = pred_func
+        self.window = window
+        self.window_size = window.shape[0]
+        self.subdivisions = subdivisions
+        
+    def _predict_batch(self, batchlist):
+        batch_l = []
+        pos_l = []
+        for pos, patch in batchlist:
+            patch = patch * self.window
+            pos_l.append(pos)
+            batch_l.append(patch)
+            
+        batch = np.array(batch_l)
+        
+        pred_batch = self.pred_func(batch)
+        
+        for i, prediction in enumerate(pred_batch):
+            z,y,x = pos_l[i]
+            self.pred_img[z: z+window_size, y: y+window_size, x:x+window_size] = self.pred_img[z: z+window_size, y: y+window_size, x:x+window_size] + prediction 
+        
+        gc.collect()
+        
+    def _normalize_prediction(self, subdivisions = None):
+        if subdivisions is None:
+            subdivisions = self.subdivisions
+        
+        self.pred_img = self.pred_img / (subdivisions **2)
+        
+        
+        
 
-def _windowed_subdivs(padded_img, window_size, subdivisions, nb_classes, pred_func):
+    
+def _windowed_subdivs(pad, window_size, subdivisions, nb_classes, pred_func):
     """
     Create tiled overlapping patches.
 
@@ -189,37 +268,51 @@ def _windowed_subdivs(padded_img, window_size, subdivisions, nb_classes, pred_fu
     Note:
         patches_resolution_along_X == patches_resolution_along_Y == window_size
     """
-    WINDOW_SPLINE_2D = _window_2D(window_size=window_size, power=2)
-
+    padded_img_path = pad[1]
+    rot = pad[0]
+    
+    padded_img = np.load(padded_img_path)
+    
+    WINDOW = _window_3D(window_size=window_size, mode = "spline")
+    
+    pad_pred = prediction_img(padded_img, pred_func, WINDOW)
+    
+    
+    # padded_out_shape=list(padded_img.shape[:-1])+[nb_classes]
+    
     step = int(window_size/subdivisions)
-    padx_len = padded_img.shape[0]
+    padx_len = padded_img.shape[2]
     pady_len = padded_img.shape[1]
+    padz_len = padded_img.shape[0]
+    
     subdivs = []
-
-    for i in range(0, padx_len-window_size+1, step):
-        subdivs.append([])
-        for j in range(0, pady_len-window_size+1, step):
-            patch = padded_img[i:i+window_size, j:j+window_size, :]
-            subdivs[-1].append(patch)
-
-    # Here, `gc.collect()` clears RAM between operations.
-    # It should run faster if they are removed, if enough memory is available.
-    gc.collect()
-    subdivs = np.array(subdivs)
-    gc.collect()
-    a, b, c, d, e = subdivs.shape
-    subdivs = subdivs.reshape(a * b, c, d, e)
-    gc.collect()
-
-    subdivs = pred_func(subdivs)
-    gc.collect()
-    subdivs = np.array([patch * WINDOW_SPLINE_2D for patch in subdivs])
-    gc.collect()
-
-    # Such 5D array:
-    subdivs = subdivs.reshape(a, b, c, d, nb_classes)
-    gc.collect()
-
+    
+    x_points = range(0, padx_len-window_size+1, step)
+    y_points = range(0, pady_len-window_size+1, step)
+    z_points = range(0, padz_len-window_size+1, step)
+    
+    batchlist =  []
+    max_batch = 10
+    
+    
+    for z in z_points:
+        # subdivs.append([])
+        for y in y_points:
+            # subdivs[-1].append([])
+            for x in x_points:
+                
+                start_point = (z,y,x)
+                patch = padded_img[z: z+window_size, y: y+window_size, x:x+window_size]
+                # subdivs[-1][-1].append(patch)
+                
+                if len(batchlist) < max_batch:
+                    batchlist.append((start_point, patch))
+                else:
+                    pad_pred._predict_batch(batchlist)
+                    batchlist = []
+    
+    
+    
     return subdivs
 
 

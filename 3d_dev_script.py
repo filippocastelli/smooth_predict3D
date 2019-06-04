@@ -31,3 +31,4 @@ predictions_smooth = predict_img_with_smooth_windowing(
     pred_func=(
         lambda img_batch_subdiv: predict_mock(img_batch_subdiv))
     )
+
