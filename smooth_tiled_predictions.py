@@ -12,18 +12,30 @@
 import numpy as np
 import scipy.signal
 from tqdm import tqdm
-
+import matplotlib.pyplot as plt
 import gc
+import logging
+logging.basicConfig(level=logging.DEBUG)
+from pathlib import Path
+import pickle
+
+tmp_path = Path("tmp")
+tmp_path.mkdir(exist_ok = True)
 
 
 if __name__ == '__main__':
-    import matplotlib.pyplot as plt
     PLOT_PROGRESS = True
     # See end of file for the rest of the __main__.
 else:
     PLOT_PROGRESS = False
 
 
+def debug_plt(image):
+    plt.imshow(image)
+    plt.show()
+    plt.pause(1)
+    
+    
 def _spline_window(window_size, power=2):
     """
     Squared spline (power=2) window function:
@@ -72,19 +84,19 @@ def _pad_img(img, window_size, subdivisions):
     """
     Add borders to img for a "valid" border pattern according to "window_size" and
     "subdivisions".
-    Image is an np array of shape (x, y, nb_channels).
+    Image is an np array of shape (x, y, z, nb_channels).
     """
     aug = int(round(window_size * (1 - 1.0/subdivisions)))
-    more_borders = ((aug, aug), (aug, aug), (0, 0))
+    more_borders = ((aug, aug), (aug, aug), (aug, aug), (0,0))
     ret = np.pad(img, pad_width=more_borders, mode='reflect')
     # gc.collect()
 
-    if PLOT_PROGRESS:
-        # For demo purpose, let's look once at the window:
-        plt.imshow(ret)
-        plt.title("Padded Image for Using Tiled Prediction Patches\n"
-                  "(notice the reflection effect on the padded borders)")
-        plt.show()
+    # if PLOT_PROGRESS:
+    #     # For demo purpose, let's look once at the window:
+    #     plt.imshow(ret)
+    #     plt.title("Padded Image for Using Tiled Prediction Patches\n"
+    #               "(notice the reflection effect on the padded borders)")
+    #     plt.show()
     return ret
 
 
@@ -112,17 +124,32 @@ def _rotate_mirror_do(im):
     It is the D_4 (D4) Dihedral group:
     https://en.wikipedia.org/wiki/Dihedral_group
     """
-    mirrs = []
-    mirrs.append(np.array(im))
-    mirrs.append(np.rot90(np.array(im), axes=(0, 1), k=1))
-    mirrs.append(np.rot90(np.array(im), axes=(0, 1), k=2))
-    mirrs.append(np.rot90(np.array(im), axes=(0, 1), k=3))
-    im = np.array(im)[:, ::-1]
-    mirrs.append(np.array(im))
-    mirrs.append(np.rot90(np.array(im), axes=(0, 1), k=1))
-    mirrs.append(np.rot90(np.array(im), axes=(0, 1), k=2))
-    mirrs.append(np.rot90(np.array(im), axes=(0, 1), k=3))
-    return mirrs
+    axes = ((0,1), (0,2), (1,2))
+    
+    rotations = []
+    def _rotations(im, flip):
+        logging.info("executing rotation set {}".format(flip))
+        for i, ax in enumerate(tqdm(axes)):
+            for n_rot in range(4):
+                id_tuple = [flip, i, n_rot]
+                fpath = tmp_path.joinpath("rot_{}_{}_{}.tmp".format(flip,i, n_rot))
+                np.save(file = fpath,
+                        arr = np.rot90(np.array(im), k = n_rot, axes = ax))
+                logging.debug("saving {}".format(fpath.name))
+                rotations.append((id_tuple, fpath))
+    
+    _rotations(im, 0)
+    im = np.array(im)[:, :, ::-1]
+    _rotations(im, 1)
+    im = np.array(im)[:, ::-1, :]
+    _rotations(im, 2)
+
+    rotpath = tmp_path.joinpath("rotpaths.pkl")
+    
+    with rotpath.open(mode = "wb") as rfile:
+        pickle.dump(rotations, rfile)
+        
+    return rotations
 
 
 def _rotate_mirror_undo(im_mirrs):
@@ -171,7 +198,7 @@ def _windowed_subdivs(padded_img, window_size, subdivisions, nb_classes, pred_fu
 
     for i in range(0, padx_len-window_size+1, step):
         subdivs.append([])
-        for j in range(0, padx_len-window_size+1, step):
+        for j in range(0, pady_len-window_size+1, step):
             patch = padded_img[i:i+window_size, j:j+window_size, :]
             subdivs[-1].append(patch)
 
@@ -209,7 +236,7 @@ def _recreate_from_subdivs(subdivs, window_size, subdivisions, padded_out_shape)
     a = 0
     for i in range(0, padx_len-window_size+1, step):
         b = 0
-        for j in range(0, padx_len-window_size+1, step):
+        for j in range(0, pady_len-window_size+1, step):
             windowed_patch = subdivs[a, b]
             y[i:i+window_size, j:j+window_size] = y[i:i+window_size, j:j+window_size] + windowed_patch
             b += 1
@@ -226,8 +253,13 @@ def predict_img_with_smooth_windowing(input_img, window_size, subdivisions, nb_c
     http://blog.kaggle.com/2017/05/09/dstl-satellite-imagery-competition-3rd-place-winners-interview-vladimir-sergey/
     """
     pad = _pad_img(input_img, window_size, subdivisions)
-    pads = _rotate_mirror_do(pad)
+    # pads = _rotate_mirror_do(pad)
 
+    rpath = tmp_path.joinpath("rotpaths.pkl")
+    with rpath.open(mode = "rb") as rfile:
+        pads = pickle.load(rfile)
+        
+    
     # Note that the implementation could be more memory-efficient by merging
     # the behavior of `_windowed_subdivs` and `_recreate_from_subdivs` into
     # one loop doing in-place assignments to the new image matrix, rather than
