@@ -7,8 +7,6 @@
 
 
 """Do smooth predictions on an image from tiled prediction patches."""
-
-
 import numpy as np
 import scipy.signal
 from tqdm import tqdm
@@ -19,225 +17,261 @@ logging.basicConfig(level=logging.DEBUG)
 from pathlib import Path
 import pickle
 
-tmp_path = Path("tmp")
-tmp_path.mkdir(exist_ok = True)
-
-
-if __name__ == '__main__':
-    PLOT_PROGRESS = True
-    # See end of file for the rest of the __main__.
-else:
-    PLOT_PROGRESS = False
-
 
 def debug_plt(image, idx = 0):
     plt.imshow(image[idx, :, :, 0])
     plt.show()
     plt.pause(1)
     
+class predictor():
     
-def _spline_window(window_size, power=2):
-    """
-    Squared spline (power=2) window function:
-    https://www.wolframalpha.com/input/?i=y%3Dx**2,+y%3D-(x-2)**2+%2B2,+y%3D(x-4)**2,+from+y+%3D+0+to+2
-    """
-    intersection = int(window_size/4)
-    wind_outer = (abs(2*(scipy.signal.triang(window_size))) ** power)/2
-    wind_outer[intersection:-intersection] = 0
-
-    wind_inner = 1 - (abs(2*(scipy.signal.triang(window_size) - 1)) ** power)/2
-    wind_inner[:intersection] = 0
-    wind_inner[-intersection:] = 0
-
-    wind = wind_inner + wind_outer
-    wind = wind / np.average(wind)
-    return wind
-
-
-def _gaus_window(window_size, k = 2.608):
-
-    x = np.arange(window_size)
-    
-    def gaus(x, x0, k):
-        std = np.sqrt( x0**2 / (8*k))
-        a = 2 / (1 - np.exp(-k))
-        c = 2 - a
-        y = a*np.exp(-((x-(x0/2))**2)/(2*std**2)) + c
+    def __init__(self, input_img,
+                 window_size,
+                 subdivisions,
+                 nb_classes,
+                 pred_func,
+                 max_batch = 10,
+                 load = True,
+                 window_mode = "spline",
+                 tmp = "tmp"):
         
-        return y
-    
-    window = gaus(x, len(x), k)
-    
-    return window
-    
-
-cached_3d_windows = dict()
-def _window_3D(window_size, mode = "gaus", power=2, k = 2.608):
-    """
-    _WINDOW_3D
-    creates 3D window, either with a 3D gaussian or a 3d square spline
-
-    Args:
-        window_size (int): size of window.
-        mode (string, optional): Mode of 3D window, can be "gaussian" or "spline". Defaults to "gaus".
-        power (int, optional): Power for spline. Defaults to 2.
-        k (float, optional): Parameter for gaussian spline. Defaults to 2.608.
-
-    Raises:
-        ValueError: if mode is unknown.
-
-    Returns:
-        wind (ndarray): 3d window.
-
-    """
-    global cached_3d_windows
-    # key = "{}_{}".format(window_size, power)
-    key = "{}_{}_{}".format(mode, window_size, k)
-    if key in cached_3d_windows:
-        wind = cached_3d_windows[key]
-    else:
+        self.tmp_path = Path(tmp)
+        self.tmp_path.mkdir(exist_ok = True)
         
-        if mode == "gaus":
-             wind = _gaus_window(window_size, k)
-        elif mode == "spline":
-            wind = _spline_window(window_size, power)
+        #INPUTS
+        self.input_img = input_img
+        self.window_size = window_size
+        self.subdivisions = subdivisions
+        self.nb_classes = nb_classes
+        self.pred_func = pred_func
+        self.load_flag = load
+        self.window_mode = window_mode
+        self.load = load
+        self.max_batch = max_batch
+        
+        # OTHER ATTRIBUTES
+        self.rot_axes = ((0,1), (0,2), (1,2))
+        self.flip_axes = ((), (2), (1,2))
+        self.rotations = []
+        self.cached_windows = dict()
+        
+        # INIT SEQUENCE
+        
+        #padding original img
+        self.padded_original, self.padding = self.pad_img(in_img = self.input_img)
+        
+        self.padded_out_shape=list(self.padded_original.shape[:-1])+[self.nb_classes]
+        self.out_shape = list(self.input_img.shape[:-1])+[self.nb_classes]
+        
+        #generate rotations
+        # debug only, if load == True load previously saved files
+        if self.load == True:
+            self.rotations = self.load_tmp()
         else:
-            raise ValueError
-
-        wind = np.expand_dims(wind, axis = -1)
-        wind = np.expand_dims(wind, axis = -1)
-        wind = np.expand_dims(wind, axis = -1)
+            self.rotations = self.gen_rotations(self.padded_original)
         
-        wind = wind * wind.transpose(1, 0, 2, 3) * wind.transpose(2,1,0, 3)
+        self.window = self.window_3D(mode = self.window_mode)
         
-        wind = wind/wind.max()
-        # profile3d = wind3d[32, 32, :, 0]
-        # plt.plot(profile3d)
-        # plt.show()
+        self.out_img = np.zeros(shape = self.out_shape, dtype = "float")
+        
+        self.average_predicted_views()
+        
+        
+    def pad_img(self, in_img):
+        
+        assert self.window_size % self.subdivisions == 0; "window size must be divisible by subdivisions"
+        
+        aug_unit = int(self.window_size/self.subdivisions)
+        
+        dims = in_img.shape[:-1]
+        # half_window = int(self.window_size / 2)
+        
+        pads = np.array([[0,0], [0,0], [0,0], [0,0]])
+        
+        for i, dim in enumerate(dims):
+            pads[i] = pads[i] + aug_unit
+            dim = dim + pads[i].sum()
+            r = dim%aug_unit
+            pads[i][0] = pads[i][0] + r // 2
+            pads[i][1] = pads[i][1] + r // 2 + r%2
 
-        if PLOT_PROGRESS:
-            # For demo purpose, let's look once at the window:
-            plt.imshow(wind[32, :, :, 0], cmap="viridis")
-            plt.title("2D Section of 3D windowing function for a Smooth Blending of "
-                      "Overlapping Patches")
-            plt.show()
-        cached_3d_windows[key] = wind
-    return wind
-
-def _pad_img(img, window_size, subdivisions):
-    """
-    Add borders to img for a "valid" border pattern according to "window_size" and
-    "subdivisions".
-    Image is an np array of shape (x, y, z, nb_channels).
-    """
-    aug = int(round(window_size * (1 - 1.0/subdivisions)))
-    more_borders = ((aug, aug), (aug, aug), (aug, aug), (0,0))
-    ret = np.pad(img, pad_width=more_borders, mode='reflect')
-    # gc.collect()
-
-    # if PLOT_PROGRESS:
-    #     # For demo purpose, let's look once at the window:
-    #     plt.imshow(ret)
-    #     plt.title("Padded Image for Using Tiled Prediction Patches\n"
-    #               "(notice the reflection effect on the padded borders)")
-    #     plt.show()
-    return ret
-
-
-def _unpad_img(padded_img, window_size, subdivisions):
-    """
-    Undo what's done in the `_pad_img` function.
-    Image is an np array of shape (x, y, nb_channels).
-    """
-    aug = int(round(window_size * (1 - 1.0/subdivisions)))
-    ret = padded_img[
-        aug:-aug,
-        aug:-aug,
-        :
-    ]
-    # gc.collect()
-    return ret
-
-
-def _rotate_mirror_do(im):
-    """
-    Duplicate an np array (image) of shape (x, y, nb_channels) 8 times, in order
-    to have all the possible rotations and mirrors of that image that fits the
-    possible 90 degrees rotations.
-
-    It is the D_4 (D4) Dihedral group:
-    https://en.wikipedia.org/wiki/Dihedral_group
-    """
-    axes = ((0,1), (0,2), (1,2))
+        padded_img = np.pad(in_img, pad_width=pads, mode='reflect')
+        
+        return padded_img, pads
     
-    rotations = []
-    def _rotations(im, flip):
+    def load_tmp(self):
+        rpath = self.tmp_path.joinpath("rotpaths.pkl")
+        
+        with rpath.open(mode = "rb") as rfile:
+            rotations = pickle.load(rfile)
+            
+        return rotations
+    
+    def gen_rotations(self, padded_img):
+        
+        img = padded_img
+        r_list = []
+        
+        for i, flip in enumerate(self.flip_axes):
+            #flip img vector
+            img = np.flip(img, axis = flip)
+            rotations = self._rot_save(img, i, r_list)
+
+        rotpath = self.tmp_path.joinpath("rotpaths.pkl")
+        
+        with rotpath.open(mode = "wb") as rfile:
+            pickle.dump(rotations, rfile)
+            
+            return rotations
+
+    def _rot_save(self, im, flip, r_list):
         logging.info("executing rotation set {}".format(flip))
-        for i, ax in enumerate(tqdm(axes)):
+        for i, ax in enumerate(tqdm(self.rot_axes)):
             for n_rot in range(4):
                 id_tuple = [flip, i, n_rot]
-                fpath = tmp_path.joinpath("rot_{}_{}_{}.npy".format(flip,i, n_rot))
+                fpath = self.tmp_path.joinpath("rot_{}_{}_{}.npy".format(flip,i, n_rot))
                 np.save(file = fpath,
                         arr = np.rot90(np.array(im), k = n_rot, axes = ax))
                 logging.debug("saving {}".format(fpath.name))
-                rotations.append((id_tuple, fpath))
-    
-    _rotations(im, 0)
-    im = np.array(im)[:, :, ::-1]
-    _rotations(im, 1)
-    im = np.array(im)[:, ::-1, :]
-    _rotations(im, 2)
-
-    rotpath = tmp_path.joinpath("rotpaths.pkl")
-    
-    with rotpath.open(mode = "wb") as rfile:
-        pickle.dump(rotations, rfile)
+                r_list.append((id_tuple, fpath))
         
-    return rotations
-
-
-def _rotate_mirror_undo(im_mirrs):
-    """
-    merges a list of 8 np arrays (images) of shape (x, y, nb_channels) generated
-    from the `_rotate_mirror_do` function. Each images might have changed and
-    merging them implies to rotated them back in order and average things out.
-
-    It is the D_4 (D4) Dihedral group:
-    https://en.wikipedia.org/wiki/Dihedral_group
-    """
-    origs = []
-    origs.append(np.array(im_mirrs[0]))
-    origs.append(np.rot90(np.array(im_mirrs[1]), axes=(0, 1), k=3))
-    origs.append(np.rot90(np.array(im_mirrs[2]), axes=(0, 1), k=2))
-    origs.append(np.rot90(np.array(im_mirrs[3]), axes=(0, 1), k=1))
-    origs.append(np.array(im_mirrs[4])[:, ::-1])
-    origs.append(np.rot90(np.array(im_mirrs[5]), axes=(0, 1), k=3)[:, ::-1])
-    origs.append(np.rot90(np.array(im_mirrs[6]), axes=(0, 1), k=2)[:, ::-1])
-    origs.append(np.rot90(np.array(im_mirrs[7]), axes=(0, 1), k=1)[:, ::-1])
-    return np.mean(origs, axis=0)
-
-class prediction_img():
-    def __init__(self, padded_img, pred_func, window, subdivisions, rot):
+        return r_list
+                
+    def window_3D(self, mode = "spline", power=2, k = 2.608):
         
-        self.padded_img = padded_img
+        key = "{}_{}_{}".format(mode, self.window_size, k)
+        
+        if key in self.cached_windows:
+            wind = self.cached_windows[key]
+        else:
+            if mode == "gaus":
+                logging.debug("shouldnt really be using that, possible artefacts")
+                wind = self.gaus_window(self.window_size, k)
+            elif mode == "spline":
+                wind = self.spline_window(self.window_size, power)
+            else:
+                raise ValueError
+    
+            wind = np.expand_dims(wind, axis = -1)
+            wind = np.expand_dims(wind, axis = -1)
+            wind = np.expand_dims(wind, axis = -1)
+            
+            wind = wind * wind.transpose(1, 0, 2, 3) * wind.transpose(2,1,0, 3)
+            
+            wind = wind/wind.max()
+            
+            self.cached_windows[key] = wind
+            
+        return wind
+    
+    @classmethod
+    def spline_window(cls, window_size, power=2):
+        intersection = int(window_size/4)
+        wind_outer = (abs(2*(scipy.signal.triang(window_size))) ** power)/2
+        wind_outer[intersection:-intersection] = 0
+    
+        wind_inner = 1 - (abs(2*(scipy.signal.triang(window_size) - 1)) ** power)/2
+        wind_inner[:intersection] = 0
+        wind_inner[-intersection:] = 0
+    
+        wind = wind_inner + wind_outer
+        wind = wind / np.average(wind)
+        return wind
+
+    @classmethod
+    def gaus_window(cls, window_size, k = 2.608):
+    
+        x = np.arange(window_size)
+        def gaus(x, x0, k):
+            std = np.sqrt( x0**2 / (8*k))
+            a = 2 / (1 - np.exp(-k))
+            c = 2 - a
+            y = a*np.exp(-((x-(x0/2))**2)/(2*std**2)) + c
+            
+            return y
+        window = gaus(x, len(x), k)
+        
+        return window
+     
+    def predict_view(self, rotation):
+        
+        pred = single_view_predictor(rotation = rotation,
+                                     pred_func = self.pred_func,
+                                     window = self.window,
+                                     subdivisions = self.subdivisions,
+                                     max_batch = self.max_batch,
+                                     rot_axes = self.rot_axes,
+                                     flip_axes = self.flip_axes,
+                                     padding = self.padding)
+        
+        predicted_view = pred.predict_from_patches()
+        
+        del pred
+        gc.collect()
+        
+        return predicted_view
+    
+    def average_predicted_views(self):
+        
+        for rotation in self.rotations:
+            
+            current_view = self.predict_view(rotation)
+            self.out_img = self.out_img + current_view
+        
+        self.out_img = self.out_img/len(self.rotations)
+        
+        return self.out_img
+
+class single_view_predictor():
+    def __init__(self,
+                 rotation,
+                 pred_func,
+                 window,
+                 padding,
+                 subdivisions,
+                 max_batch = 8,
+                 rot_axes = None,
+                 flip_axes = None):
+        
+        #INPUTS
+        
+        self.path = rotation[1]
+        self.rot_id = rotation[0]
         self.pred_func = pred_func
         self.window = window
         self.window_size = window.shape[0]
         self.subdivisions = subdivisions
-        self.rotation = rot
-        self.aug = int(round(self.window_size * (1 - 1.0/subdivisions)))
+        self.max_batch = max_batch
+        self.padding = padding
 
-        self.axes = ((0,1), (0,2), (1,2))
-        # self.flips = ((0,0,0), (0,0,1), (0,1,1))
-        self.flips = ((), (2), (1,2))
         
-        self.pred_img = np.zeros_like(padded_img).astype("float")
+        #OTHER ATTRIBUTES
+        self.aug = int(round(self.window_size * (1 - 1.0/subdivisions)))
         
-    def _predict_batch(self, batchlist):
+        
+        if rot_axes is None:
+            self.rot_axes = ((0,1), (0,2), (1,2))
+        else:
+            self.rot_axes = rot_axes
+            
+        if flip_axes is None:
+            self.flip_axes = ((), (2), (1,2))
+        else:
+            self.flip_axes = flip_axes
+        
+        self.batch_queue = []
+        
+        #INIT SEQUENCE
+        
+        # load padded img
+        self.padded_img = np.load(self.path)
+        #create prediction blank
+        self.pred_img = np.zeros_like(self.padded_img).astype("float")
+        
+    def _predict_batch(self):
         batch_l = []
         pos_l = []
-        for pos, patch in batchlist:
-            patch = patch * self.window
+        for pos, patch in self.batch_queue:
             pos_l.append(pos)
             batch_l.append(patch)
             
@@ -247,12 +281,18 @@ class prediction_img():
         pred_batch = self.pred_func(batch)
         window_size = self.window_size
         for i, prediction in enumerate(pred_batch):
+            prediction = prediction * self.window
             z,y,x = pos_l[i]
             self.pred_img[z: z+window_size, y: y+window_size, x:x+window_size] = self.pred_img[z: z+window_size, y: y+window_size, x:x+window_size] + prediction 
         
         gc.collect()
         
-    def _normalize_prediction(self, subdivisions = None):
+        #empty queue
+        self.batch_queue = []
+        
+        return self
+        
+    def _normalize(self, subdivisions = None):
         if subdivisions is None:
             subdivisions = self.subdivisions
         
@@ -260,21 +300,26 @@ class prediction_img():
         
     def _back_transform(self):
 
-        flipn, ax, k = self.rot
+        flipn, ax, k = self.rot_id
         #rot first, flip last
-        self._unrot(flipn)
-        self._unflip(ax,k)
+        self._unrot(ax,k)
+        self._unflip(flipn)
+        self._unpad()
         
     def _unflip(self, flipn):
-        flip = self.flips[flipn]
+        flip = self.flip_axes[flipn]
         self.pred_img = np.flip(self.pred_img,axis = flip)
         
     def _unrot(self, ax, k):
-        self.pred_img = np.rot90(self.pred_img,k = -k, axes = self.axes[ax])
+        self.pred_img = np.rot90(self.pred_img,k = -k, axes = self.rot_axes[ax])
         
     def _unpad(self):
-        aug = self.aug
-        self.pred_img = self.pred_img[aug:-aug, aug:-aug, aug:-aug, :]
+        # aug = self.aug
+        z_min, z_max = self.padding[0]
+        y_min, y_max = self.padding[1]
+        x_min, x_max = self.padding[2]
+        
+        self.pred_img = self.pred_img[z_min : -z_max, y_min : -y_max, x_min : -x_max, :]
         
     def plot_padded(self, idx = 0):
         plt.imshow(self.padded_img[idx, :, :,0])
@@ -286,336 +331,38 @@ class prediction_img():
         plt.colorbar()
         plt.show()
         
+    def predict_from_patches(self):
+
+        padz_len, pady_len, padx_len = self.padded_img.shape[:-1]
         
-
-    
-def _windowed_subdivs(pad, window_size, subdivisions, nb_classes, pred_func):
-    """
-    Create tiled overlapping patches.
-
-    Returns:
-        5D numpy array of shape = (
-            nb_patches_along_X,
-            nb_patches_along_Y,
-            patches_resolution_along_X,
-            patches_resolution_along_Y,
-            nb_output_channels
-        )
-
-    Note:
-        patches_resolution_along_X == patches_resolution_along_Y == window_size
-    """
-    padded_img_path = pad[1]
-    rot = pad[0]
-    
-    #(images are in z,y,x,1 format)
-    padded_img = np.load(padded_img_path)
-    
-    WINDOW = _window_3D(window_size=window_size, mode = "spline")
-    
-    pad_pred = prediction_img(padded_img, pred_func, WINDOW,subdivisions, rot)
-    
-    
-    # padded_out_shape=list(padded_img.shape[:-1])+[nb_classes]
-    
-    step = int(window_size/subdivisions)
-    padx_len = padded_img.shape[2]
-    pady_len = padded_img.shape[1]
-    padz_len = padded_img.shape[0]
-    
-    subdivs = []
-    
-    x_points = range(0, padx_len-window_size+1, step)
-    y_points = range(0, pady_len-window_size+1, step)
-    z_points = range(0, padz_len-window_size+1, step)
-    
-    batchlist =  []
-    max_batch = 10
-    
-    
-    for z in z_points:
-        # subdivs.append([])
-        for y in y_points:
-            # subdivs[-1].append([])
-            for x in x_points:
-                
-                start_point = (z,y,x)
-                patch = padded_img[z: z+window_size, y: y+window_size, x:x+window_size, :]
-                # subdivs[-1][-1].append(patch)
-                
-                if len(batchlist) < max_batch-1:
-                    batchlist.append((start_point, patch))
-                else:
-                    batchlist.append((start_point, patch))
-                    pad_pred._predict_batch(batchlist)
-                    batchlist = []
-    
-    if len(batchlist) > 0:
-        pad_pred._predict_batch(batchlist)
+        step = int(self.window_size/self.subdivisions)
         
-    pad_pred.plot_padded()
-    pad_pred.plot_pred()
-    
-    pad_pred._normalize_prediction()
-    
-    pad_pred.plot_padded()
-    pad_pred.plot_pred()
-    
-    print("cucc")
-    return subdivs
-
-
-def _recreate_from_subdivs(subdivs, window_size, subdivisions, padded_out_shape):
-    """
-    Merge tiled overlapping patches smoothly.
-    """
-    step = int(window_size/subdivisions)
-    padx_len = padded_out_shape[0]
-    pady_len = padded_out_shape[1]
-
-    y = np.zeros(padded_out_shape)
-
-    a = 0
-    for i in range(0, padx_len-window_size+1, step):
-        b = 0
-        for j in range(0, pady_len-window_size+1, step):
-            windowed_patch = subdivs[a, b]
-            y[i:i+window_size, j:j+window_size] = y[i:i+window_size, j:j+window_size] + windowed_patch
-            b += 1
-        a += 1
-    return y / (subdivisions ** 2)
-
-
-def predict_img_with_smooth_windowing(input_img, window_size, subdivisions, nb_classes, pred_func, load = True ):
-    """
-    Apply the `pred_func` function to square patches of the image, and overlap
-    the predictions to merge them smoothly.
-
-    See 6th, 7th and 8th idea here:
-    http://blog.kaggle.com/2017/05/09/dstl-satellite-imagery-competition-3rd-place-winners-interview-vladimir-sergey/
-    """
-    pad = _pad_img(input_img, window_size, subdivisions)
-
-    if load == True:
-        rpath = tmp_path.joinpath("rotpaths.pkl")
-        with rpath.open(mode = "rb") as rfile:
-            pads = pickle.load(rfile)
-            
-    else:
-        pads = _rotate_mirror_do(pad)
+        x_points = range(0, padx_len-self.window_size+1, step)
+        y_points = range(0, pady_len-self.window_size+1, step)
+        z_points = range(0, padz_len-self.window_size+1, step)
+   
         
-    
-    # Note that the implementation could be more memory-efficient by merging
-    # the behavior of `_windowed_subdivs` and `_recreate_from_subdivs` into
-    # one loop doing in-place assignments to the new image matrix, rather than
-    # using a temporary 5D array.
+        for z in z_points:
+            for y in y_points:
+                for x in x_points:
+                    start_point = (z,y,x)
+                    patch = self.padded_img[z: z+self.window_size, y: y+self.window_size, x:x+self.window_size, :]
+                    
+                    assert patch.shape == (self.window_size,self.window_size,self.window_size, self.padded_img.shape[-1]);"Padded image should contain an integer number of windows, something's wrong with padding"
+                    if len(self.batch_queue) < self.max_batch-1:
+                        self.batch_queue.append((start_point, patch))
+                    else:
+                        self.batch_queue.append((start_point, patch))
+                        self._predict_batch()
+        
+        #if there are remaining patches process them
+        if len(self.batch_queue) > 0:
+            self._predict_batch()
 
-    # It would also be possible to allow different (and impure) window functions
-    # that might not tile well. Adding their weighting to another matrix could
-    # be done to later normalize the predictions correctly by dividing the whole
-    # reconstructed thing by this matrix of weightings - to normalize things
-    # back from an impure windowing function that would have badly weighted
-    # windows.
-
-    # For example, since the U-net of Kaggle's DSTL satellite imagery feature
-    # prediction challenge's 3rd place winners use a different window size for
-    # the input and output of the neural net's patches predictions, it would be
-    # possible to fake a full-size window which would in fact just have a narrow
-    # non-zero dommain. This may require to augment the `subdivisions` argument
-    # to 4 rather than 2.
-
-    res = []
-    for pad in tqdm(pads):
-        # For every rotation:
-        sd = _windowed_subdivs(pad, window_size, subdivisions, nb_classes, pred_func)
-        one_padded_result = _recreate_from_subdivs(
-            sd, window_size, subdivisions,
-            padded_out_shape=list(pad.shape[:-1])+[nb_classes])
-
-        res.append(one_padded_result)
-
-    # Merge after rotations:
-    padded_results = _rotate_mirror_undo(res)
-
-    prd = _unpad_img(padded_results, window_size, subdivisions)
-
-    prd = prd[:input_img.shape[0], :input_img.shape[1], :]
-
-    if PLOT_PROGRESS:
-        plt.imshow(prd)
-        plt.title("Smoothly Merged Patches that were Tiled Tighter")
-        plt.show()
-    return prd
+        self._normalize()
+        self._back_transform()
+        
+        return self.pred_img
 
 
-def cheap_tiling_prediction(img, window_size, nb_classes, pred_func):
-    """
-    Does predictions on an image without tiling.
-    """
-    original_shape = img.shape
-    full_border = img.shape[0] + (window_size - (img.shape[0] % window_size))
-    prd = np.zeros((full_border, full_border, nb_classes))
-    tmp = np.zeros((full_border, full_border, original_shape[-1]))
-    tmp[:original_shape[0], :original_shape[1], :] = img
-    img = tmp
-    print(img.shape, tmp.shape, prd.shape)
-    for i in tqdm(range(0, prd.shape[0], window_size)):
-        for j in range(0, prd.shape[0], window_size):
-            im = img[i:i+window_size, j:j+window_size]
-            prd[i:i+window_size, j:j+window_size] = pred_func([im])
-    prd = prd[:original_shape[0], :original_shape[1]]
-    if PLOT_PROGRESS:
-        plt.imshow(prd)
-        plt.title("Cheaply Merged Patches")
-        plt.show()
-    return prd
 
-
-def get_dummy_img(xy_size=128, nb_channels=3):
-    """
-    Create a random image with different luminosity in the corners.
-
-    Returns an array of shape (xy_size, xy_size, nb_channels).
-    """
-    x = np.random.random((xy_size, xy_size, nb_channels))
-    x = x + np.ones((xy_size, xy_size, 1))
-    lin = np.expand_dims(
-        np.expand_dims(
-            np.linspace(0, 1, xy_size),
-            nb_channels),
-        nb_channels)
-    x = x * lin
-    x = x * lin.transpose(1, 0, 2)
-    x = x + x[::-1, ::-1, :]
-    x = x - np.min(x)
-    x = x / np.max(x) / 2
-    gc.collect()
-    if PLOT_PROGRESS:
-        plt.imshow(x)
-        plt.title("Random image for a test")
-        plt.show()
-    return x
-
-
-def round_predictions(prd, nb_channels_out, thresholds):
-    """
-    From a threshold list `thresholds` containing one threshold per output
-    channel for comparison, the predictions are converted to a binary mask.
-    """
-    assert (nb_channels_out == len(thresholds))
-    prd = np.array(prd)
-    for i in range(nb_channels_out):
-        # Per-pixel and per-channel comparison on a threshold to
-        # binarize prediction masks:
-        prd[:, :, i] = prd[:, :, i] > thresholds[i]
-    return prd
-
-
-if __name__ == '__main__':
-    ###
-    # Image:
-    ###
-
-    img_resolution = 600
-    # 3 such as RGB, but there could be more in other cases:
-    nb_channels_in = 3
-
-    # Get an image
-    input_img = get_dummy_img(img_resolution, nb_channels_in)
-    # Normally, preprocess the image for input in the neural net:
-    # input_img = to_neural_input(input_img)
-
-    ###
-    # Neural Net predictions params:
-    ###
-
-    # Number of output channels. E.g. a U-Net may output 10 classes, per pixel:
-    nb_channels_out = 3
-    # U-Net's receptive field border size, it does not absolutely
-    # need to be a divisor of "img_resolution":
-    window_size = 128
-
-    # This here would be the neural network's predict function, to used below:
-    def predict_for_patches(small_img_patches):
-        """
-        Apply prediction on images arranged in a 4D array as a batch.
-
-        Here, we use a random color filter for each patch so as to see how it
-        will blend.
-
-        Note that the np array shape of "small_img_patches" is:
-            (nb_images, x, y, nb_channels_in)
-        The returned arra should be of the same shape, except for the last
-        dimension which will go from nb_channels_in to nb_channels_out
-        """
-        small_img_patches = np.array(small_img_patches)
-        rand_channel_color = np.random.random(size=(
-            small_img_patches.shape[0],
-            1,
-            1,
-            small_img_patches.shape[-1])
-        )
-        return small_img_patches * rand_channel_color * 2
-
-    ###
-    # Doing cheap tiled prediction:
-    ###
-
-    # Predictions, blending the patches:
-    cheaply_predicted_img = cheap_tiling_prediction(
-        input_img, window_size, nb_channels_out, pred_func=predict_for_patches
-    )
-
-    ###
-    # Doing smooth tiled prediction:
-    ###
-
-    # The amount of overlap (extra tiling) between windows. A power of 2, and is >= 2:
-    subdivisions = 2
-
-    # Predictions, blending the patches:
-    smoothly_predicted_img = predict_img_with_smooth_windowing(
-        input_img, window_size, subdivisions,
-        nb_classes=nb_channels_out, pred_func=predict_for_patches
-    )
-
-    ###
-    # Demonstrating that the reconstruction is correct:
-    ###
-
-    # No more plots from now on
-    PLOT_PROGRESS = False
-
-    # useful stats to get a feel on how high will be the error relatively
-    print(
-        "Image's min and max pixels' color values:",
-        np.min(input_img),
-        np.max(input_img))
-
-    # First, defining a prediction function that just returns the patch without
-    # any modification:
-    def predict_same(small_img_patches):
-        """
-        Apply NO prediction on images arranged in a 4D array as a batch.
-        This implies that nb_channels_in == nb_channels_out: dimensions
-        and contained values are unchanged.
-        """
-        return small_img_patches
-
-    same_image_reconstructed = predict_img_with_smooth_windowing(
-        input_img, window_size, subdivisions,
-        nb_classes=nb_channels_out, pred_func=predict_same
-    )
-
-    diff = np.mean(np.abs(same_image_reconstructed - input_img))
-    print(
-        "Mean absolute reconstruction difference on pixels' color values:",
-        diff)
-    print(
-        "Relative absolute mean error on pixels' color values:",
-        100*diff/(np.max(input_img)) - np.min(input_img),
-        "%")
-    print(
-        "A low error (e.g.: 0.28 %) confirms that the image is still "
-        "the same before and after reconstruction if no changes are "
-        "made by the passed prediction function.")
