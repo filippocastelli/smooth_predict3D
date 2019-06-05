@@ -30,8 +30,8 @@ else:
     PLOT_PROGRESS = False
 
 
-def debug_plt(image):
-    plt.imshow(image)
+def debug_plt(image, idx = 0):
+    plt.imshow(image[idx, :, :, 0])
     plt.show()
     plt.pause(1)
     
@@ -110,6 +110,7 @@ def _window_3D(window_size, mode = "gaus", power=2, k = 2.608):
         
         wind = wind * wind.transpose(1, 0, 2, 3) * wind.transpose(2,1,0, 3)
         
+        wind = wind/wind.max()
         # profile3d = wind3d[32, 32, :, 0]
         # plt.plot(profile3d)
         # plt.show()
@@ -216,13 +217,21 @@ def _rotate_mirror_undo(im_mirrs):
     return np.mean(origs, axis=0)
 
 class prediction_img():
-    def __init__(self, padded_img, pred_func, window, subdivisions):
+    def __init__(self, padded_img, pred_func, window, subdivisions, rot):
+        
         self.padded_img = padded_img
-        self.pred_img = np.zeros_like(padded_img)
         self.pred_func = pred_func
         self.window = window
         self.window_size = window.shape[0]
         self.subdivisions = subdivisions
+        self.rotation = rot
+        self.aug = int(round(self.window_size * (1 - 1.0/subdivisions)))
+
+        self.axes = ((0,1), (0,2), (1,2))
+        # self.flips = ((0,0,0), (0,0,1), (0,1,1))
+        self.flips = ((), (2), (1,2))
+        
+        self.pred_img = np.zeros_like(padded_img).astype("float")
         
     def _predict_batch(self, batchlist):
         batch_l = []
@@ -234,8 +243,9 @@ class prediction_img():
             
         batch = np.array(batch_l)
         
+        #(10,64,64,64,1)
         pred_batch = self.pred_func(batch)
-        
+        window_size = self.window_size
         for i, prediction in enumerate(pred_batch):
             z,y,x = pos_l[i]
             self.pred_img[z: z+window_size, y: y+window_size, x:x+window_size] = self.pred_img[z: z+window_size, y: y+window_size, x:x+window_size] + prediction 
@@ -248,6 +258,33 @@ class prediction_img():
         
         self.pred_img = self.pred_img / (subdivisions **2)
         
+    def _back_transform(self):
+
+        flipn, ax, k = self.rot
+        #rot first, flip last
+        self._unrot(flipn)
+        self._unflip(ax,k)
+        
+    def _unflip(self, flipn):
+        flip = self.flips[flipn]
+        self.pred_img = np.flip(self.pred_img,axis = flip)
+        
+    def _unrot(self, ax, k):
+        self.pred_img = np.rot90(self.pred_img,k = -k, axes = self.axes[ax])
+        
+    def _unpad(self):
+        aug = self.aug
+        self.pred_img = self.pred_img[aug:-aug, aug:-aug, aug:-aug, :]
+        
+    def plot_padded(self, idx = 0):
+        plt.imshow(self.padded_img[idx, :, :,0])
+        plt.colorbar()
+        plt.show()
+        
+    def plot_pred(self, idx = 0):
+        plt.imshow(self.pred_img[idx, :, :,0])
+        plt.colorbar()
+        plt.show()
         
         
 
@@ -271,11 +308,12 @@ def _windowed_subdivs(pad, window_size, subdivisions, nb_classes, pred_func):
     padded_img_path = pad[1]
     rot = pad[0]
     
+    #(images are in z,y,x,1 format)
     padded_img = np.load(padded_img_path)
     
     WINDOW = _window_3D(window_size=window_size, mode = "spline")
     
-    pad_pred = prediction_img(padded_img, pred_func, WINDOW)
+    pad_pred = prediction_img(padded_img, pred_func, WINDOW,subdivisions, rot)
     
     
     # padded_out_shape=list(padded_img.shape[:-1])+[nb_classes]
@@ -302,17 +340,28 @@ def _windowed_subdivs(pad, window_size, subdivisions, nb_classes, pred_func):
             for x in x_points:
                 
                 start_point = (z,y,x)
-                patch = padded_img[z: z+window_size, y: y+window_size, x:x+window_size]
+                patch = padded_img[z: z+window_size, y: y+window_size, x:x+window_size, :]
                 # subdivs[-1][-1].append(patch)
                 
-                if len(batchlist) < max_batch:
+                if len(batchlist) < max_batch-1:
                     batchlist.append((start_point, patch))
                 else:
+                    batchlist.append((start_point, patch))
                     pad_pred._predict_batch(batchlist)
                     batchlist = []
     
+    if len(batchlist) > 0:
+        pad_pred._predict_batch(batchlist)
+        
+    pad_pred.plot_padded()
+    pad_pred.plot_pred()
     
+    pad_pred._normalize_prediction()
     
+    pad_pred.plot_padded()
+    pad_pred.plot_pred()
+    
+    print("cucc")
     return subdivs
 
 
@@ -337,7 +386,7 @@ def _recreate_from_subdivs(subdivs, window_size, subdivisions, padded_out_shape)
     return y / (subdivisions ** 2)
 
 
-def predict_img_with_smooth_windowing(input_img, window_size, subdivisions, nb_classes, pred_func):
+def predict_img_with_smooth_windowing(input_img, window_size, subdivisions, nb_classes, pred_func, load = True ):
     """
     Apply the `pred_func` function to square patches of the image, and overlap
     the predictions to merge them smoothly.
@@ -346,11 +395,14 @@ def predict_img_with_smooth_windowing(input_img, window_size, subdivisions, nb_c
     http://blog.kaggle.com/2017/05/09/dstl-satellite-imagery-competition-3rd-place-winners-interview-vladimir-sergey/
     """
     pad = _pad_img(input_img, window_size, subdivisions)
-    # pads = _rotate_mirror_do(pad)
 
-    rpath = tmp_path.joinpath("rotpaths.pkl")
-    with rpath.open(mode = "rb") as rfile:
-        pads = pickle.load(rfile)
+    if load == True:
+        rpath = tmp_path.joinpath("rotpaths.pkl")
+        with rpath.open(mode = "rb") as rfile:
+            pads = pickle.load(rfile)
+            
+    else:
+        pads = _rotate_mirror_do(pad)
         
     
     # Note that the implementation could be more memory-efficient by merging
