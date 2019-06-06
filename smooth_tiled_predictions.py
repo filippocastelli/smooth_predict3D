@@ -1,8 +1,9 @@
 # =============================================================================
-# smooth_predict
-# FIlippo Maria Castelli
+# smooth_predict3D
+#
+# Coded by FIlippo Maria Castelli
 # 
-# smooth 3D patch-based predictions for 3D extended volumes
+# Smooth 3D patch-based predictions for extended volumes
 #
 # forked from 2D project Smoothly-Blend-Image-Patches by Guillaume Chevalier
 # https://github.com/Vooban/Smoothly-Blend-Image-Patches
