@@ -2,7 +2,15 @@
 
 Forked from 2D analogous project https://github.com/Vooban/Smoothly-Blend-Image-Patches by Vooban Inc
 
+Performs 3D patch-based, prediction of extended volumes averaging over different
+flips and rotations of the same volume to reduce noise.
+
+For every view each voxel is predicted n times using sliding 3D windows, border
+effects are minimized using a 3D second order spline window function to prioritize
+the central area of the receptive field.
+
 Implementation details to be added soon.
+
 # How to use:
 
 ```python
@@ -33,12 +41,14 @@ predictions_smooth = predict_img_with_smooth_windowing(
     nb_classes=nb_classes,
     pred_func=(
         lambda img_batch_subdiv: model.predict(image_to_neural_input(img_batch_subdiv))
-    )
+    ),
+    max_batch = 10 # Maximum numbers of patches in a batch
 )
 
 # For more details, refer to comments in code
 ```
 Coded by [Filippo Castelli](https://github.com/filippocastelli)
+
 Forked from original project by [Guillaume Chevalier](https://github.com/guillaume-chevalier)
 
 [MIT License](https://github.com/filippocastelli/smooth_predict3D/blob/master/LICENSE). Copyright (c) 2019 Filippo Maria Castelli
