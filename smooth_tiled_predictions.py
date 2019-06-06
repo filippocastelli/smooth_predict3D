@@ -211,7 +211,8 @@ class smooth_predict():
         img = padded_img
         r_list = []
         
-        for i, flip in enumerate(self.flip_axes):
+        logging.info("Executing flips and rotations of original dataset")
+        for i, flip in enumerate(tqdm(self.flip_axes)):
             #flip img vector
             img = np.flip(img, axis = flip)
             rotations = self._rot_save(img, i, r_list)
@@ -226,7 +227,7 @@ class smooth_predict():
     def _rot_save(self, im, flip, r_list):
         """ method for generating rotations of already flipped tensors and saving
         them"""
-        logging.info("executing rotation set {}".format(flip))
+        logging.debug("Executing rotation set {}".format(flip))
         for i, ax in enumerate(tqdm(self.rot_axes)):
             for n_rot in range(4):
                 id_tuple = [flip, i, n_rot]
@@ -356,7 +357,8 @@ class smooth_predict():
     def _average_predicted_views(self):
         """ performs an average of all views to obtain final prediction"""
         
-        for rotation in self.rotations:
+        logging.info("Predicting and averaging single views")
+        for rotation in tqdm(self.rotations):
             
             current_view = self._predict_view(rotation)
             self.out_img = self.out_img + current_view
@@ -533,7 +535,7 @@ class single_view_predictor():
         z_points = range(0, padz_len-self.window_size+1, step)
    
         
-        for z in z_points:
+        for z in tqdm(z_points):
             for y in y_points:
                 for x in x_points:
                     start_point = (z,y,x)
