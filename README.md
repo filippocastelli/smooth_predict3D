@@ -1,7 +1,5 @@
 # 3D Smoothly Blended Patch-Based Prediction of Extended Volumes
 
-Forked from 2D analogous project https://github.com/Vooban/Smoothly-Blend-Image-Patches by Vooban Inc
-
 Performs 3D patch-based, prediction of extended volumes averaging over different
 flips and rotations of the same volume to reduce noise.
 
@@ -11,6 +9,7 @@ the central area of the receptive field.
 
 Implementation details to be added soon.
 
+Derivative work of 2D analogous project https://github.com/Vooban/Smoothly-Blend-Image-Patches by Vooban Inc
 # How to use:
 
 ```python
