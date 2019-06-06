@@ -1,39 +1,96 @@
-# MIT License
-# Copyright (c) 2017 Vooban Inc.
-# Coded by: Guillaume Chevalier
-# Source to original code and license:
-#     https://github.com/Vooban/Smoothly-Blend-Image-Patches
-#     https://github.com/Vooban/Smoothly-Blend-Image-Patches/blob/master/LICENSE
+# =============================================================================
+# smooth_predict
+# FIlippo Maria Castelli
+# 
+# smooth 3D patch-based predictions for 3D extended volumes
+#
+# forked from 2D project Smoothly-Blend-Image-Patches by Guillaume Chevalier
+# https://github.com/Vooban/Smoothly-Blend-Image-Patches
+# =============================================================================
 
-
-"""Do smooth predictions on an image from tiled prediction patches."""
+# IMPORTS
 import numpy as np
 import scipy.signal
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import gc
 import logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 from pathlib import Path
 import pickle
-
-
-def debug_plt(image, idx = 0):
-    plt.imshow(image[idx, :, :, 0])
-    plt.show()
-    plt.pause(1)
     
-class predictor():
+class smooth_predict():
+    """
+    smooth_predict
     
+    Patch-based prediction of extended 3D volumes:
+    Takes the original volume, makes 3D rotations and flips, performs patch-based
+    reconstruction of prediction using a 3D square spline window function and then
+    averages the back-transformed results to output a final prediction volume.
+    
+    smooth_predict is agnostic to the particular system used to generate predictions
+    so it's intrinsecally compatible with any model from Keras, TF, sklearn, Pytorch etc...
+    
+    note: smooth_predict generates a temp folder for storage of heavy tensors to free
+    up RAM space: make sure there is enough disk-space available for the script execution,
+    current setup needs at least 37x the dimension of the original 3D volume
+    on disk and 3x on RAM.
+    
+    note: smooth_predict operates in channel_last convention, however you can
+    pre-transorm input data to be in channel_last format and define a lambda for 
+    the prediction conversion, format selection can be part of a future release
+    
+    note: current padding scheme needs the window_size parameter to be an even 
+    multiple of the subdivisions parameter, this limitation can be overcome in a
+    future release.
+    
+    Parameters
+    ----------
+    input_img : ndarray
+        input tensor, should be in the format (z,y,x,channels),
+        first three axes should be permutable so there's no real need for 
+        a specific ordering as long as channel_last format for input data is mantained
+        If your model operates in channel_first format see pred_func
+    window_size : int
+        Linear size of the cubic window, must be an even multiple of subdivisions.
+    subdivisions : int
+        Number of times each pixel has to be predicted in extended image reconstruction,
+        must be an even number, typically 2.
+    nb_classes : int
+        Number of non-background classes.
+    pred_func : lambda
+        Prediction function, you can just write a lambda that returns the prediction
+        results for a given input batch.
+        
+        >>> lambda pred_func : image_batch : model.predict(image_batch)
+    max_batch : int, optional
+        Max number of items to be sent in a prediction batch,
+        choose it accordingly to your GPU and your model. The default is 10.
+    tmp : str, optional
+        name of temp folder. The default is "tmp".
+    window_mode : str, optional
+        INTENDED AS A DEBUG TOOL ONLY, type of 3D window function, can be
+        "spline" or "gaus". The default is "spline".
+    load : bool, optional
+        INTENDED AS A DEBUG TOOL ONLY, loads pre-existend tmp files instead of creating
+        new ones. The default is False.
+
+    Returns
+    -------
+    out_img : ndarray
+        output tensor
+
+    """
     def __init__(self, input_img,
                  window_size,
                  subdivisions,
                  nb_classes,
                  pred_func,
                  max_batch = 10,
-                 load = True,
+                 tmp = "tmp",
                  window_mode = "spline",
-                 tmp = "tmp"):
+                 load = False):
+
         
         self.tmp_path = Path(tmp)
         self.tmp_path.mkdir(exist_ok = True)
@@ -58,7 +115,7 @@ class predictor():
         # INIT SEQUENCE
         
         #padding original img
-        self.padded_original, self.padding = self.pad_img(in_img = self.input_img)
+        self.padded_original, self.padding = self._pad_img(in_img = self.input_img)
         
         self.padded_out_shape=list(self.padded_original.shape[:-1])+[self.nb_classes]
         self.out_shape = list(self.input_img.shape[:-1])+[self.nb_classes]
@@ -66,18 +123,37 @@ class predictor():
         #generate rotations
         # debug only, if load == True load previously saved files
         if self.load == True:
-            self.rotations = self.load_tmp()
+            self.rotations = self._load_tmp()
         else:
-            self.rotations = self.gen_rotations(self.padded_original)
+            self.rotations = self._gen_rotations(self.padded_original)
         
         self.window = self.window_3D(mode = self.window_mode)
         
         self.out_img = np.zeros(shape = self.out_shape, dtype = "float")
         
-        self.average_predicted_views()
+        self._average_predicted_views()
         
         
-    def pad_img(self, in_img):
+    def _pad_img(self, in_img):
+        """
+        _pad_img
+        
+        applies padding to input img
+
+        Parameters
+        ----------
+        in_img : ndarray
+            input img.
+
+        Returns
+        -------
+        padded_img : ndarray
+            padded img.
+        pads : TYPE
+            list of padding parameters,
+            [[in_pad_z, out_pad_z],[in_pad_y, out_pad_y],[in_pad_x, out_pad_x], [0,0]] format.
+
+        """
         
         assert self.window_size % self.subdivisions == 0; "window size must be divisible by subdivisions"
         
@@ -99,7 +175,8 @@ class predictor():
         
         return padded_img, pads
     
-    def load_tmp(self):
+    def _load_tmp(self):
+        """ loads self.rotations from disk"""
         rpath = self.tmp_path.joinpath("rotpaths.pkl")
         
         with rpath.open(mode = "rb") as rfile:
@@ -107,7 +184,29 @@ class predictor():
             
         return rotations
     
-    def gen_rotations(self, padded_img):
+    def _gen_rotations(self, padded_img):
+        """
+        _gen_rotations
+        
+        Routine for generating flipped and rotation version of the input, saves
+        the results in temp folders and appends rotation_id and path to saved file
+        in 'rotations'.
+        
+        Parameters
+        ----------
+        padded_img : ndarray
+            input img.
+
+        Returns
+        -------
+        rotations : list
+            [rotation_id, Path] format.
+            rotation_id is a tuple (flip_axis, rot_axis, n_of_rotations)
+            flip_axis is an index of self.flip_axes
+            rot_axis is an index of self.rot_axes
+            n_of_rotations is an int
+            Path is a pathlib-style path
+        """
         
         img = padded_img
         r_list = []
@@ -125,6 +224,8 @@ class predictor():
             return rotations
 
     def _rot_save(self, im, flip, r_list):
+        """ method for generating rotations of already flipped tensors and saving
+        them"""
         logging.info("executing rotation set {}".format(flip))
         for i, ax in enumerate(tqdm(self.rot_axes)):
             for n_rot in range(4):
@@ -138,6 +239,29 @@ class predictor():
         return r_list
                 
     def window_3D(self, mode = "spline", power=2, k = 2.608):
+        """
+        generates 3D window function from 1D profiles
+
+        Parameters
+        ----------
+        mode : str, optional
+            Can be "spline" or "gaus". The default is "spline".
+        power : int, optional
+            For spline function, power of spline approx. The default is 2.
+        k : TYPE, optional
+            For gaus function, ratio of x0/sigma. The default is 2.608.
+
+        Raises
+        ------
+        ValueError
+            if mode is unknown.
+
+        Returns
+        -------
+        wind : ndarray
+            (window_size, window_size, window_size) window function.
+
+        """
         
         key = "{}_{}_{}".format(mode, self.window_size, k)
         
@@ -166,6 +290,7 @@ class predictor():
     
     @classmethod
     def spline_window(cls, window_size, power=2):
+        """ generates 1D spline window"""
         intersection = int(window_size/4)
         wind_outer = (abs(2*(scipy.signal.triang(window_size))) ** power)/2
         wind_outer[intersection:-intersection] = 0
@@ -180,6 +305,7 @@ class predictor():
 
     @classmethod
     def gaus_window(cls, window_size, k = 2.608):
+        """generates 1D gaus window"""
     
         x = np.arange(window_size)
         def gaus(x, x0, k):
@@ -193,7 +319,23 @@ class predictor():
         
         return window
      
-    def predict_view(self, rotation):
+    def _predict_view(self, rotation):
+        """
+        for a given flip/rotation of 3D input space instantiates a single_view_predictor
+        for patch-based prediction of that view
+
+        Parameters
+        ----------
+        rotation : list
+            Tuple in format (rot_id, rot_path), see smooth_predict._gen_rotations
+            docstrings for details.
+
+        Returns
+        -------
+        predicted_view : ndarray
+            reconstructed 3D prediction.
+
+        """
         
         pred = single_view_predictor(rotation = rotation,
                                      pred_func = self.pred_func,
@@ -211,11 +353,12 @@ class predictor():
         
         return predicted_view
     
-    def average_predicted_views(self):
+    def _average_predicted_views(self):
+        """ performs an average of all views to obtain final prediction"""
         
         for rotation in self.rotations:
             
-            current_view = self.predict_view(rotation)
+            current_view = self._predict_view(rotation)
             self.out_img = self.out_img + current_view
         
         self.out_img = self.out_img/len(self.rotations)
@@ -232,6 +375,38 @@ class single_view_predictor():
                  max_batch = 8,
                  rot_axes = None,
                  flip_axes = None):
+        """
+        single_view_predictor class
+        
+        executes patch-based prediction of a single flipped/rotated view and then
+        performs back-transform to the original format
+
+        Parameters
+        ----------
+        rotation : tuple
+            (rot_id, rot_path).
+        pred_func : lambda
+            single patch prediction function.
+        window : ndarray
+            3D window for patch masking.
+        padding : list
+            vector containing information on padding, see smooth_predict._pad_img
+            docstrings for further informations.
+        subdivisions : int
+            Number of subdivisions.
+        max_batch : int, optional
+            Max items to put in a batch. The default is 8.
+        rot_axes : list, optional
+            list of rotation axes. The default is None.
+        flip_axes : list, optional
+            list of flipping axes. The default is None.
+
+        Returns
+        -------
+        out_view : ndarray
+            output prediction
+
+        """
         
         #INPUTS
         
@@ -269,6 +444,11 @@ class single_view_predictor():
         self.pred_img = np.zeros_like(self.padded_img).astype("float")
         
     def _predict_batch(self):
+        """ create a batch, send it to predict_func,
+        multiply results by window function,
+        add results to output image,
+        clear batch
+        """
         batch_l = []
         pos_l = []
         for pos, patch in self.batch_queue:
@@ -281,24 +461,27 @@ class single_view_predictor():
         pred_batch = self.pred_func(batch)
         window_size = self.window_size
         for i, prediction in enumerate(pred_batch):
+            #TODO: speed up by extending window to batch size and multiplying entire batch
+            #instead of doing it patch-per-patch
             prediction = prediction * self.window
             z,y,x = pos_l[i]
             self.pred_img[z: z+window_size, y: y+window_size, x:x+window_size] = self.pred_img[z: z+window_size, y: y+window_size, x:x+window_size] + prediction 
         
-        gc.collect()
-        
         #empty queue
         self.batch_queue = []
+        gc.collect()
         
         return self
         
     def _normalize(self, subdivisions = None):
+        """ divide image by subdivisions^3"""
         if subdivisions is None:
             subdivisions = self.subdivisions
         
-        self.pred_img = self.pred_img / (subdivisions **2)
+        self.pred_img = self.pred_img / (subdivisions **3)
         
     def _back_transform(self):
+        """perform unrotation, unflipping and unpadding"""
 
         flipn, ax, k = self.rot_id
         #rot first, flip last
@@ -307,13 +490,16 @@ class single_view_predictor():
         self._unpad()
         
     def _unflip(self, flipn):
+        """ flips image to original format"""
         flip = self.flip_axes[flipn]
         self.pred_img = np.flip(self.pred_img,axis = flip)
         
     def _unrot(self, ax, k):
+        """rotate image to original format"""
         self.pred_img = np.rot90(self.pred_img,k = -k, axes = self.rot_axes[ax])
         
     def _unpad(self):
+        """removes padding"""
         # aug = self.aug
         z_min, z_max = self.padding[0]
         y_min, y_max = self.padding[1]
@@ -322,16 +508,21 @@ class single_view_predictor():
         self.pred_img = self.pred_img[z_min : -z_max, y_min : -y_max, x_min : -x_max, :]
         
     def plot_padded(self, idx = 0):
+        """debug plot function to see padded image"""
         plt.imshow(self.padded_img[idx, :, :,0])
         plt.colorbar()
         plt.show()
         
     def plot_pred(self, idx = 0):
+        """debug plot function to see predicted image"""
         plt.imshow(self.pred_img[idx, :, :,0])
         plt.colorbar()
         plt.show()
         
     def predict_from_patches(self):
+        """Prediction routine: creates patches of original input volume, feeds them
+        to predictor in batches, performs normalization and back transforming
+        retunrs output image"""
 
         padz_len, pady_len, padx_len = self.padded_img.shape[:-1]
         
@@ -364,5 +555,12 @@ class single_view_predictor():
         
         return self.pred_img
 
-
+# =============================================================================
+# misc
+# =============================================================================
+def debug_plt(image, idx = 0):
+    """dirty function for debuggin in ipdb"""
+    plt.imshow(image[idx, :, :, 0])
+    plt.show()
+    plt.pause(1)
 
