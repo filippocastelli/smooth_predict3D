@@ -1,5 +1,6 @@
 # 3D Smoothly Blended Patch-Based Prediction of Extended Volumes
 
+# <img src="/img/sp3d.png" alt="Drawing" width = "400"></img>
 Performs 3D patch-based, prediction of extended volumes averaging over different
 flips and rotations of the same volume to reduce noise.
 
