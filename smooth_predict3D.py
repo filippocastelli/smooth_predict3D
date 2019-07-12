@@ -18,6 +18,7 @@ import gc
 import logging
 logging.basicConfig(level=logging.INFO)
 from pathlib import Path
+import shutil
 import pickle
 
 
@@ -80,6 +81,10 @@ class smooth_predict():
         new ones. The default is False.
     rot_axes : tuple
         specify rotation axes planes
+    debug_plots : bool
+        enables debug plots
+    keep_tmp : bool
+        if enabled keeps temporary files
     
 
     Returns
@@ -99,7 +104,8 @@ class smooth_predict():
                  rot_axes = [(0,1), (0,2), (1,2)],
                  flip_axes = [(1,), (2,)],
                  load = False,
-                 debug_plots = False):
+                 debug_plots = False,
+                 keep_tmp = False):
 
         #SANITY CHECKS
         assert len(input_img.shape) == 4; "Data must be in z,y,x,channels format"
@@ -126,6 +132,7 @@ class smooth_predict():
         self.load = load
         self.max_batch = max_batch
         self.debug_plots = debug_plots
+        self.keep_tmp = keep_tmp
 
         # OTHER ATTRIBUTES
         self.rot_axes = rot_axes
@@ -389,6 +396,11 @@ class smooth_predict():
         self.out_img = self.out_img/len(self.rotations)
         
         return self.out_img
+
+    def __del__(self):
+        if self.keep_tmp == False:
+            logging.info("removing temporary files...")
+            shutil.rmtree(self.tmp_path)
 
 class single_view_predictor():
     def __init__(self,
