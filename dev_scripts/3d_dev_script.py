@@ -1,46 +1,25 @@
-from smooth_tiled_predictions import predictor
-from matplotlib import pylab as plt
-from pathlib import Path
-from skimage import io
+import sys
 import numpy as np
+from skimage import io
+sys.path.append("..")
+from smooth_predict3D import smooth_predict, debug_plt
 #%%
-stack_path = Path("/media/phil/HDD0/dataset3d/orig_stacks")
 
-try:
-    mask_path
-    img_path
-except:
-    img_path = stack_path.joinpath("training.tif")
-    mask_path = stack_path.joinpath("training_groundtruth.tif")
-    img_volume = io.imread(img_path, plugin = "pil")
-    # mask_volume = io.imread(mask_path, plugin = "pil")
-    # mask_volume = np.where(mask_volume == 255, 1, 0)
-    
-    
+volume = io.imread("/media/phil/HDD0/dataset3d/orig_stacks/training.tif")
+# gt = io.imread("/media/phil/HDD0/dataset3D/orig_stacks/training_groundtruth.tif")
 
-input_volume = img_volume[0:82, 0:384, 0:512]
-    
-# input_volume = np.zeros_like(input_volume) + 255
-    
-def predict_mock(img):
-    return img/255
+volume_prep  = np.expand_dims(volume, -1)
+debug_plt(volume_prep, title = "original")
+def pred_mock(image):
+    return image
 
 
-# predictions_smooth = predict_img_with_smooth_windowing(
-#     np.expand_dims(input_volume, axis = -1),
-#     window_size=64,
-#     subdivisions=2,  # Minimal amount of overlap for windowing. Must be an even number.
-#     nb_classes=1,
-#     pred_func=(
-#         lambda img_batch_subdiv: predict_mock(img_batch_subdiv)),
-#     load = True
-#     )
-#%%
-smooth_pred = predictor(input_img = np.expand_dims(input_volume, axis = -1),
-                        window_size = 64,
-                        subdivisions = 2,
-                        nb_classes = 1,
-                        pred_func = (lambda img_batch: predict_mock(img_batch)),
-                        load = True)
-
-        
+sp = smooth_predict(input_img = volume_prep,
+                    window_size = (64,64,64),
+                    subdivisions = 2,
+                    nb_classes = 1,
+                    pred_func = pred_mock,
+                    max_batch = 10,
+                    rot_axes = ((1,2),),
+                    flip_axes =[(1,), (2,)],
+                    load = True)
