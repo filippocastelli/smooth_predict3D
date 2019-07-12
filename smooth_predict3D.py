@@ -19,7 +19,10 @@ import logging
 logging.basicConfig(level=logging.INFO)
 from pathlib import Path
 import pickle
-    
+
+
+#TODO: Optimize data views
+
 class smooth_predict():
     """
     smooth_predict
@@ -75,6 +78,9 @@ class smooth_predict():
     load : bool, optional
         INTENDED AS A DEBUG TOOL ONLY, loads pre-existend tmp files instead of creating
         new ones. The default is False.
+    rot_axes : tuple
+        specify rotation axes planes
+    
 
     Returns
     -------
@@ -90,9 +96,22 @@ class smooth_predict():
                  max_batch = 10,
                  tmp = "tmp",
                  window_mode = "spline",
-                 load = False):
+                 rot_axes = [(0,1), (0,2), (1,2)],
+                 flip_axes = [(1,), (2,)],
+                 load = False,
+                 debug_plots = False):
 
-        
+        #SANITY CHECKS
+        assert len(input_img.shape) == 4; "Data must be in z,y,x,channels format"
+        for rot_couple in rot_axes:
+            assert len(rot_couple) == 2; "Two axes are required for defining a rotation plane"
+            assert all(dim < 4 for dim in rot_couple); "Rotation plane does not exist"
+            assert rot_couple[0] != rot_couple[1]; "Rotation plane must be defined by two different axes"
+
+        for ax in flip_axes:
+            assert len(ax) < 3
+            assert all(dim <  len(input_img.shape) for dim in ax)
+
         self.tmp_path = Path(tmp)
         self.tmp_path.mkdir(exist_ok = True)
         
@@ -106,10 +125,12 @@ class smooth_predict():
         self.window_mode = window_mode
         self.load = load
         self.max_batch = max_batch
-        
+        self.debug_plots = debug_plots
+
         # OTHER ATTRIBUTES
-        self.rot_axes = ((0,1), (0,2), (1,2))
-        self.flip_axes = ((), (2), (1,2))
+        self.rot_axes = rot_axes
+        self.flip_axes = flip_axes
+        self.flip_axes.insert(0, ())
         self.rotations = []
         self.cached_windows = dict()
         
@@ -156,9 +177,9 @@ class smooth_predict():
 
         """
         
-        assert self.window_size % self.subdivisions == 0; "window size must be divisible by subdivisions"
+        assert self.window_size[0] % self.subdivisions == 0; "window size must be divisible by subdivisions"
         
-        aug_unit = int(self.window_size/self.subdivisions)
+        aug_unit = int(self.window_size[0]/self.subdivisions)
         
         dims = in_img.shape[:-1]
         # half_window = int(self.window_size / 2)
@@ -216,23 +237,23 @@ class smooth_predict():
         for i, flip in enumerate(tqdm(self.flip_axes)):
             #flip img vector
             img = np.flip(img, axis = flip)
-            rotations = self._rot_save(img, i, r_list)
+            r_list = self._rot_save(img, flip, r_list)
 
         rotpath = self.tmp_path.joinpath("rotpaths.pkl")
         
         with rotpath.open(mode = "wb") as rfile:
-            pickle.dump(rotations, rfile)
+            pickle.dump(r_list, rfile)
             
-            return rotations
+        return r_list
 
     def _rot_save(self, im, flip, r_list):
         """ method for generating rotations of already flipped tensors and saving
         them"""
         logging.debug("Executing rotation set {}".format(flip))
         for i, ax in enumerate(tqdm(self.rot_axes)):
-            for n_rot in range(4):
+            for n_rot in range(3):
                 id_tuple = [flip, i, n_rot]
-                fpath = self.tmp_path.joinpath("rot_{}_{}_{}.npy".format(flip,i, n_rot))
+                fpath = self.tmp_path.joinpath("rot_{}_{}_{}.npy".format(''.join(tuple(map(str, flip))),i, n_rot))
                 np.save(file = fpath,
                         arr = np.rot90(np.array(im), k = n_rot, axes = ax))
                 logging.debug("saving {}".format(fpath.name))
@@ -272,9 +293,9 @@ class smooth_predict():
         else:
             if mode == "gaus":
                 logging.debug("shouldnt really be using that, possible artefacts")
-                wind = self.gaus_window(self.window_size, k)
+                wind = self.gaus_window(self.window_size[0], k)
             elif mode == "spline":
-                wind = self.spline_window(self.window_size, power)
+                wind = self.spline_window(self.window_size[0], power)
             else:
                 raise ValueError
     
@@ -309,7 +330,7 @@ class smooth_predict():
     def gaus_window(cls, window_size, k = 2.608):
         """generates 1D gaus window"""
     
-        x = np.arange(window_size)
+        x = np.arange(window_size[0])
         def gaus(x, x0, k):
             std = np.sqrt( x0**2 / (8*k))
             a = 2 / (1 - np.exp(-k))
@@ -360,8 +381,9 @@ class smooth_predict():
         
         logging.info("Predicting and averaging single views")
         for rotation in tqdm(self.rotations):
-            
             current_view = self._predict_view(rotation)
+            if self.debug_plots == True:
+                debug_plt(current_view, title = str(rotation[0]))
             self.out_img = self.out_img + current_view
         
         self.out_img = self.out_img/len(self.rotations)
@@ -486,16 +508,15 @@ class single_view_predictor():
     def _back_transform(self):
         """perform unrotation, unflipping and unpadding"""
 
-        flipn, ax, k = self.rot_id
+        flip_ax, ax, k = self.rot_id
         #rot first, flip last
         self._unrot(ax,k)
-        self._unflip(flipn)
+        self._unflip(flip_ax)
         self._unpad()
         
-    def _unflip(self, flipn):
+    def _unflip(self, flip_ax):
         """ flips image to original format"""
-        flip = self.flip_axes[flipn]
-        self.pred_img = np.flip(self.pred_img,axis = flip)
+        self.pred_img = np.flip(self.pred_img,axis = flip_ax)
         
     def _unrot(self, ax, k):
         """rotate image to original format"""
@@ -561,9 +582,11 @@ class single_view_predictor():
 # =============================================================================
 # misc
 # =============================================================================
-def debug_plt(image, idx = 0):
+def debug_plt(image, idx = 0, title = None):
     """dirty function for debuggin in ipdb"""
     plt.imshow(image[idx, :, :, 0])
+    if title is not None:
+        plt.title(title)
     plt.show()
     plt.pause(1)
 
