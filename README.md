@@ -1,5 +1,9 @@
 # 3D Smoothly Blended Patch-Based Prediction of Extended Volumes
 
+## --- DISCLAIMER: REPO IN BROKEN STATE ---
+This repo is currently in a *BROKEN* state and updates are not in short-time schedule as for now. If you're interested in using SP3D you can submit an issue and I'll schedule maintainance.
+
+
 # <img src="/img/sp3d.png" alt="Drawing" width = "400"></img>
 Performs 3D patch-based, prediction of extended volumes averaging over different
 flips and rotations of the same volume to reduce noise.
